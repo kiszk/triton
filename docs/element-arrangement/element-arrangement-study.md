@@ -1,516 +1,465 @@
-# Element Arrangement: Summary of KTIR–KTDF Design Decisions
+# Element Arrangement: Design Decisions from KTIR to DFIR 
 
 ## 1. Summary of Design Decisions
 
-**Separate the carrier of EA state from actual EA transformations, and preserve the contracts from KTIR through KTDF.** The medium- to long-term recommendation is EA-P003: H10 + H6, using `RankedTensorType.encoding` for tensor SSA values and an explicit `convert_ea` for transformations. At the FIFO/memref stages, transfer the same descriptor into checked slot/read/write contracts. Adding encoding alone is insufficient: current type reconstruction and flattening preserve only shape and element type.[KF4][S3][S4][D1]
+**The preferred medium- to long-term design combines builtin RankedTensorType encoding in KTIR/KTDF, explicit EA conversion operations, and verified attributes at buffer/FIFO boundaries (EA-P003: H10 + H6 + H7).** Keep numerical casts and arrangement conversions semantically separate, combining them during lowering only when they can be fused into the same hardware operation. The choice of EA representation alone does not determine performance: establish legality first, then compare conversion counts, bytes, temporary storage, and inter-core communication among legal candidates.
 
-**Do not add new instructions or attributes** to the final Dataflow dialect. Introduce new stages/routes/transfers before PathExpansion, tiling, and parallelization, or rerun the affected planning. Finalize reserved local moves and buffers before CustomLinalgBufferization/AddressAssignment. Only register-local shuffles whose resources have already been reserved may remain until KTDFLow→DFIR, where the unit and sub-SIMD width are fixed. Ultimately, materialize them into existing memory views, agen load/store, send/receive, and vectorchain operations, leaving no EA-specific ops, attributes, or types.[S1][S6]
+Treat EA as the mapping between logical indices and arrangement. Distinguish and verify geometry, logical dtype, device format, packing, validity, replication, and core ownership. This does not mean that the current EA enum alone contains validity or replication information. Shorthand: S = STANDARD, U = DL16_TO_FP32, D = FP32_TO_DL16, and R = the valid reduction value for each row (notation introduced by this proposal).
 
-Numerical casts have a separate contract (EA-P001). `dl16tofp32`/`fp32todl16` combine numerical conversion with output EA constraints; restickify alone must not replace them. Currently, PyTorch bf16 becomes SEN169_FP16 on the device and `f16` in the emitter, but bf16, DLFloat16, and IEEE f16 do not have identical representations or rounding. Mechanically replacing the casts with `arith.extf/truncf` was also rejected by the scheduler in the small IR test that was run.[TS3][TS5][TS11][KF6][S2]
+In the short term, establish contracts and verifiers (EA-P001) and the necessary numerical cast, operation, and grid support (EA-P005). Preserve legal U intervals while restoring the required arrangement at consumer/host boundaries (EA-P002). Where retention into KTDF is not yet available, concretize the arrangement by the KTIR exit. Do not require S before and after every operation. If the type migration is too extensive, the H7 attribute approach (EA-P006) is the principal alternative.
 
-| Timing / proposal | Policy to adopt | Rationale / gate |
-| --- | --- | --- |
-| P0, EA-P001 | Descriptors and capability contracts that separate logical dtype/shape, physical format, and rounding from EA/order/validity | Validate exact maps, partial sticks, slice/core granularity, and the numerical semantics of dtype pairs |
-| P0, EA-P002 | End-to-end casts → B's grid → mean/broadcast → C's fp32 geometry → C/D output EA → integration of all four examples | Resolving one rejection does not complete EA support. Preserve original cast positions and input conditions |
-| P1, EA-P003 | H10 + H6. Preserve type contracts and explicit transformations through KTDF | Demonstrate preservation through encoding→FIFO/memref→DFIR with small O/A/D prototypes |
-| P1, EA-P004 | H7 + H6. Strong alternative using mandatory op attributes and explicit transformations | Switch if encoding support requires widespread changes to standard passes. Reject missing attributes with boundary verifiers |
-| P2, EA-P005 | Transformation sharing, movement, load/store fusion, and cost-based selection over legal candidates only | Enable after establishing correctness for all four examples. Separate byte proxies from measured latency |
+**Do not add EA-specific operations or attributes to final DFIR.** Implement arrangements and conversions through `dataflow.get_logical_memory_view`, existing load/store and send/receive operations, vectorchain.shuffle/pack/cast, and related existing operations. The implementation that expands existing KTDF splat into receive + shuffle was confirmed, but this precedent alone does not guarantee arbitrary EA conversions.[D4][D5][D6]
 
-Triton [#229](https://github.com/torch-spyre/triton/issues/229) is used as the user-specified **future premise** that downstream restickify is available for fp16, dlfloat16, float32, int16, and int32. It does not imply support for arbitrary EA pairs/shapes, numerical casts, bf16=DL16, or negligible cost. If the required maps or numerical casts cannot be connected to existing DFIR operations, those inputs cannot be legalized, and acceptance of the four examples remains incomplete.
+Adopt the user-specified triton#229 premise that restickify for fp16/df16/f32/i16/i32 will be available in the future. This does not imply numerical casts, arbitrary shapes or arrangement pairs, free conversions, or bf16 = df16. A separate premise permits implementing the required numerical conversions; EA-P005 must verify and implement their connection to existing DFIR representations and their numerical contracts.
 
-### 1.1 Current Validation and Strength of the Conclusions
+|Design decision|Rationale|Conditions / validation that could change the decision|
+|---|---|---|
+|Type encoding + explicit conversions|Use types to distinguish SSA values with different EAs and make conversions for each use visible|Encoding must survive KTDP loads, shape inference, and bufferization. Prioritize H7 if too many passes fail|
+|Retain information into KTDF|Select arrangements with visibility into tiles, resources, FIFOs, and liveness|Expose type widths and resource requirements by pre_scheduling; finalize the plan after TileSizeSelection and before allocation|
+|Separate casts|Preserve the rounding order in A/B, integer-to-f32 conversion and post-trigonometric bf16 conversion in C, and the f32 output in D|Verify BF16/DF16 ranges and rounding, and the actual EA produced by native casts|
+|Expand into existing DFIR|Align responsibilities with the existing splat approach without requiring a new Dataflow ABI|Empirically verify U/D mappings, same-core requirements, groups/offsets/tails, and the corresponding shuffles/transfers|
 
-CPU results were obtained for all four examples. The Spyre runs, preserving bf16 inputs, bf16 weights in A/B, and `dynamic=False`, stopped as follows. **Completion and successful numerical comparison of the four examples remain unverified.**
+Currently, A (Granite) and D (Softmax) stopped because `dl16tofp32` is not registered in KTIR; B (GptOss) stopped on a grid mismatch with 32 cores; and C (RoPE) stopped at a stick compatibility check before KTIR. Running B with one core progresses to the missing cast registration. All 191 existing KTIR unit tests and compilation of an existing f16 add through KTIR → KTDF → DFIR → SpyreCode succeeded. Numerical agreement for the four examples and optimization performance remain unverified.
 
-| Example | First observed stopping point | Design implication |
-| --- | --- | --- |
-| A Granite | Unregistered `dl16tofp32` in the KTIR plan | After f32 normalization, round to bf16 before multiplying by the weight |
-| B GptOss | Mixed work division in the KTIR plan | Split the upcast of the 4096-element weight into a separate kernel/function, explicitly defining buffer ownership and completion synchronization. Narrow to bf16 after multiplication |
-| C RoPE | Incompatible fp32 sticks during layout selection before KTIR | Align the different stick axes on the position and frequency sides. Geometry and EA order are separate issues |
-| D Softmax | Unregistered `dl16tofp32` in the KTIR plan | Keep f32 through the output. Do not add a narrowing cast to repair output EA |
+Execution used the baseline Python sources, but matching build SHAs for all C++ extensions and the frontend package have not been confirmed. The scheduler reference version and the installed binary differ in their passes. For `TORCH_SPYRE_KTIR=1`, the config evaluation to True and entry into generate_ktir for A/B/D were recorded; C is not treated as having passed through KTIR.[S1][S1b][S2]
 
-All 191 existing KTIR validation and emitter unit tests passed. A separate bf16[1,64] addition executed on the Spyre runtime through the KTIR path and matched the CPU with atol=rtol=0. Independent add IR also confirmed KTIR→KTDF→Dataflow and spyrecode generation. The build-time SHAs of the installed frontend/_C/dbo could not be fully established; these successes must not be generalized to CI or the four examples.
+### 1.1 Numerical Contract and How to Read the Proposed IR
 
-### 1.2 Proposed KTIR and KTDF for the Four Examples
+Current H2D transfer converts PyTorch bf16 to SEN169_FP16, which the KTIR emitter currently spells f16. In contrast, `!spyreop.df16` uses 1/6/9 bits, while bf16 uses 1/8/7. These formats must not be equated. Adding logical dtype metadata cannot recover values already lost during H2D conversion. Guaranteeing the full BF16 range requires changing the storage boundary. If the current storage format is retained, the supported range and precision contract must be restricted.[S3b][S9][F6]
 
-The following makes **EA-P003's proposed IR closer to MLIR syntax**; it is not IR generated by the current compiler from the four programs. `func.func`, `func.call`, `arith`, and `math` use existing MLIR syntax. New ops use the generic forms `"ktdp.numeric_cast"`, `"ktdp.convert_ea"`, and `"ktdf.convert_ea"`, with a **`// NEW OP (proposal)` comment at every use**. Their names, attributes, verifiers, and lowering are unimplemented proposals.
+EA-v1 is a **new proposed specification**. `#ea.layout<S/U/D/R>` is shorthand for encoding; the full form contains group/phase information, a position mapping, validity, and packing, and checks consistency with dtype, shape, and owner. `ea.numeric_cast` preserves logical shape and indices while converting the type using the specified rounding. `rounding="exact_extension"` denotes exact bf16-to-f32 extension, `rounding="rne"` denotes round-to-nearest-even, and integers carry `signedness="signed"`. The result encoding is an arrangement requirement separate from the numerical semantics.
 
-**Reading types and encodings:** encoding is part of a tensor type, but is shown as a third component distinct from shape and element type.
+`ea.rearrange` changes EA while preserving the same logical shape, dtype, and payload. It is not merely a type relabeling operation. `ea.payload` links the sequence-order and validity contracts across FIFO producers, writes, and reads; a read-side declaration alone does not change the arrangement. These abstractions are consumed into existing representations by DFIR generation.
 
-| Notation | Meaning |
-| --- | --- |
-| `tensor<128x128x32xf32, #XU>` | Device shape `[128,128,32]`, element type `f32`, encoding attribute `#XU` |
-| `#XU = {...}` | Attribute alias carrying EA order, logical shape, and references to map/validity contracts |
-| `!X32U = tensor<128x128x32xf32, #XU>` | Type alias for the complete tensor type, not a new dialect type |
-| `!spyreop.df16` | Existing frontend DLFloat16 element type; neither PyTorch `bf16` nor IEEE `f16` |
-| `memref<...xf32>` / `!ktdf.fifo.slot<..., 64xf32>` | No tensor encoding; transfer information into proposed checked contracts such as `ea.contract` |
+A computes `bf16(w * bf16(n32))`; B computes `bf16(f32(w) * n32)`. On the CPU, h = 1.00390625 and w = 1.5 yield A = 1.5 and B = 1.5078125. Agreement within tolerance or cancellation of an EA round trip does not justify exchanging these cast positions.
 
-This does not mean that the current torch emitter's spelling of DL16 as `f16` has been changed. These examples explicitly use the existing `!spyreop.df16` to avoid conflating numerical semantics, and place logical bf16 conversion/rounding in cast attributes and helper contracts. Implementing this requires the numerical contracts and type adapters in EA-P001/P002.[KF6][TS11]
+### 1.2 KTIR and KTDF for the Four Examples (Proposals Including New Specifications)
 
-**Scope of shapes and maps:** A/B activations use the confirmed device shapes (16-bit `[128,64,64]`, f32 `[128,128,32]`), and D's f32 shape is `[4,128,32]`. Other weight/reduction shapes and C intermediates are **proposed physical storage envelopes** chosen to make the examples concrete, not claimed as generated shapes. Reduction encodings `#RS/#MS` and C's `#PB` are candidates with one valid scalar per row; exact lanes are specified by the contract referenced by `valid_ref`. A `map_ref` names a concrete map not supplied here; no map has been inferred from shape alone. Implementation must check OpSpec coordinates and backend capabilities and reject lowering if a contract is unresolved. This does not propose replacing device tensor shapes with logical shapes in the initial implementation.
+The following eight examples are **proposed IR containing new specifications; they are not implemented**. Each module uses MLIR type, SSA, and function syntax and explicitly shows numerical ordering and EA boundaries. This is not IR generated by the current compiler. The private helpers invoked by `func.call` define expansion contracts to keep the explanation compact; they are neither new runtime APIs nor existing backend intrinsics. In an implementation, expand them into `linalg.generic/reduce` and related operations defined below before KTIR legality checking and mapping. The helper declarations alone do not make these modules executable.
 
-**Boundary of the KTDF examples:** these are structural examples at the stage where tensor values remain. Actual `ktdf.pipeline`/stage/route regions, tiling, and resource allocation are omitted. `func.call @..._stage` and `retain/reload` name **helper functions** standing for omitted bodies; they are neither new stage instructions nor a claim that the current scheduler accepts these calls. FIFO conversion transfers encoding into checked contracts as illustrated by the adapter below. Per-use reloads from retained buffers produce separate channels, not unlimited rereading or CSE of FIFO reads.[D6] Introduce new routes/stages before the affected planning passes and leave no new EA instructions or attributes in final Dataflow.
+|Helper group|Definition and lowering contract|
+|---|---|
+|square_u|f32 `x*x` for each logical element, corresponding to the current decomposition of pow(2)|
+|mean_last_4096|Mean over the 4,096 elements of the last axis. Explicitly specify a sum initializer of 0 and divisor of 4096; fix the reduction tree and scaling position through the numerical contract. Do not read an uninitialized tensor as an accumulator|
+|add_eps_1e5 / rsqrt_row / mul_rows_u|Add eps = 1e-5 in f32, apply rsqrt, then broadcast the row scalar along the last axis for f32 multiplication. Splat the valid value in R|
+|mul_weight_bf16 / mul_weight_f32|Broadcast w[h] across batch/sequence. The former is a bf16 product with bf16 output rounding; the latter is an f32 product. Do not interchange them between A and B|
+|outer_freq / duplicate_last|Compute `positions[b,s]*inv_freq[h]`, then concatenate two copies along the last axis. Preserve logical index order and group boundaries|
+|cos_f32 / sin_f32 / scale_one|f32 trigonometric operations and multiplication by f32 1.0. Do not move the output bf16 cast into these operations|
+|max_last_128 / sum_last_128|Initialize max with −∞ and sum with 0. Define NaN and tie contracts and preserve f32 reductions and masks|
+|sub_rows / exp_f32 / div_rows|Broadcast the row maximum and subtract it, compute f32 exp, then divide by the row sum in f32. D has no conversion back to 16 bits|
 
-Common encoding/type aliases (the illustrative dictionary schema is proposed; MLIR alias syntax is existing):
+The combination of logical bf16 and EA-v1 specifies the target semantics. The current H2D SEN169 conversion or KTIR f16 alias must not be treated as an implementation of this IR. Verifying how existing DFIR casts, integer bit operations, or related operations implement BF16 rounding and range is mandatory under EA-P005. C shows the representation after proving that i64-to-device-i32 conversion is exact for positions in 0..127. This does not generalize beyond that range. The values of x are unnecessary, so x is omitted from the IR arguments. inv_freq remains f32.
 
-```mlir
-// PROPOSED encoding schema: builtin DictionaryAttr, not a current EA attribute.
-// map_ref / valid_ref name contracts to be supplied and verified; they are not maps.
-#XS = {order = "STANDARD", logical_shape = array<i64: 1, 128, 4096>, map_ref = "X.S64", valid_ref = "all"}
-#XU = {order = "DL16_TO_FP32", logical_shape = array<i64: 1, 128, 4096>, map_ref = "X.U32", valid_ref = "all"}
-#RS = {order = "STANDARD", logical_shape = array<i64: 1, 128, 1>, map_ref = "R.rows", valid_ref = "one_scalar_per_row"}
-#WS = {order = "STANDARD", logical_shape = array<i64: 4096>, map_ref = "W.S64", valid_ref = "all"}
-#WU = {order = "DL16_TO_FP32", logical_shape = array<i64: 4096>, map_ref = "W.U32", valid_ref = "all"}
+The KTDF examples are **stage skeletons of computation graphs that retain EA**, not complete schedules mapped to physical resources. Input/output slots describe the entire logical payload; an implementation splits it into legal capacities in KTIRMapAndTile before KTDF generation and in subsequent KTDF tile selection. This does not mean rerunning KTIRMapAndTile on these skeletons. `LXLU/SFP/LXSU` are existing resource names; their use does not imply that bf16, trigonometric operations, or new casts can currently be mapped to those resources. Decompose row dependencies, tokens, and DMA stages, then verify FIFO capacities and ordering before proceeding to executable form. The skeletons compare H10 information retention and numerical operation ordering in A/B/C/D.
 
-// Existing scalar type !spyreop.df16 denotes physical DLFloat16, NOT bf16.
-// !... aliases denote COMPLETE types; #... aliases denote encoding ATTRIBUTES.
-!X16S = tensor<128x64x64x!spyreop.df16, #XS>
-!X32U = tensor<128x128x32xf32, #XU>
-!R32S = tensor<128x1x32xf32, #RS>
-!W16S = tensor<64x64x!spyreop.df16, #WS>
-!W32U = tensor<128x32xf32, #WU>
-!MX32 = memref<128x128x32xf32>  // No tensor encoding on a memref.
-!MR32 = memref<128x1x32xf32>
-!MW32 = memref<128x32xf32>
+#### A: Granite RMSNorm
 
-#P0 = {order = "STANDARD", logical_shape = array<i64: 1, 128>, map_ref = "P.sequence_stick", valid_ref = "all"}
-#P1 = {order = "STANDARD", logical_shape = array<i64: 1, 128, 1>, map_ref = "P.unsqueeze", valid_ref = "all"}
-#PB = {order = "STANDARD", logical_shape = array<i64: 1, 128, 1>, map_ref = "P.frequency_stick", valid_ref = "one_scalar_per_row"}
-#IS = {order = "STANDARD", logical_shape = array<i64: 64>, map_ref = "inv_freq.S32", valid_ref = "all"}
-#FS = {order = "STANDARD", logical_shape = array<i64: 1, 128, 64>, map_ref = "F.S32", valid_ref = "all"}
-#ES32 = {order = "STANDARD", logical_shape = array<i64: 1, 128, 128>, map_ref = "E.S32", valid_ref = "all"}
-#ED16 = {order = "FP32_TO_DL16", logical_shape = array<i64: 1, 128, 128>, map_ref = "E.D16", valid_ref = "all"}
-#ES16 = {order = "STANDARD", logical_shape = array<i64: 1, 128, 128>, map_ref = "E.S16", valid_ref = "all"}
-!P0I = tensor<1x4x32xi32, #P0>
-!P1I = tensor<1x4x1x32xi32, #P1>
-!P1F = tensor<1x4x1x32xf32, #P1>
-!PBF = tensor<1x1x128x32xf32, #PB>
-!IF = tensor<2x32xf32, #IS>
-!F32S = tensor<1x2x128x32xf32, #FS>
-!E32S = tensor<1x4x128x32xf32, #ES32>
-!E16D = tensor<1x2x128x64x!spyreop.df16, #ED16>
-!E16S = tensor<1x2x128x64x!spyreop.df16, #ES16>
-!MF32 = memref<1x2x128x32xf32>
-!ME32 = memref<1x4x128x32xf32>
-
-#QS16 = {order = "STANDARD", logical_shape = array<i64: 128, 128>, map_ref = "Q.S64", valid_ref = "all"}
-#QU32 = {order = "DL16_TO_FP32", logical_shape = array<i64: 128, 128>, map_ref = "Q.U32", valid_ref = "all"}
-#QS32 = {order = "STANDARD", logical_shape = array<i64: 128, 128>, map_ref = "Q.S32", valid_ref = "all"}
-#MS = {order = "STANDARD", logical_shape = array<i64: 128, 1>, map_ref = "M.rows", valid_ref = "one_scalar_per_row"}
-!Q16S = tensor<2x128x64x!spyreop.df16, #QS16>
-!Q32U = tensor<4x128x32xf32, #QU32>
-!Q32S = tensor<4x128x32xf32, #QS32>
-!M32S = tensor<1x128x32xf32, #MS>
-!MQ32 = memref<4x128x32xf32>
-```
-
-First, the shared f32 portion of A/B. Reduction helpers preserve the logical last axis, valid elements, fp32 accumulation, and original operation order; broadcasting distributes only the corresponding row's scalar along the hidden axis. Epsilon uses a shape-aware helper rather than applying `arith.addf` directly to a scalar and tensor. Syntactic validity of `arith`/`math` does not prove legal lowering for U; no fastmath or reassociation permission is added.
+Proposed KTIR (new specification):
 
 ```mlir
-// Existing func/arith/math ops. Calls name explanatory helpers, NOT new ops.
-// mean_hidden_U: logical last axis, valid elements only, fp32 accumulation,
-// original reduction-order contract, division by 4096, one result per row.
-func.func @rms_f32_ktir(%x: !X32U) -> !X32U {
-  %sq = arith.mulf %x, %x : !X32U
-  %v = func.call @mean_hidden_U(%sq) : (!X32U) -> !R32S
-  %eps = arith.constant 1.0e-5 : f32
-  %ve = func.call @add_epsilon_rows(%v, %eps) : (!R32S, f32) -> !R32S
-  %inv = math.rsqrt %ve : !R32S
-  %scale = func.call @broadcast_rows_to_hidden(%inv) : (!R32S) -> !X32U
-  %n = arith.mulf %x, %scale : !X32U
-  return %n : !X32U
-}
+// New specification: EA-v1 encoding and ea.numeric_cast / ea.rearrange.
+// Specification helpers: func.call expands to linalg, etc., as defined in the text.
+#S = #ea.layout<S>
+#U = #ea.layout<U>
+#D = #ea.layout<D>
+#R = #ea.layout<R>
+module {
+  func.func private @square_u(tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xf32, #U>
+  func.func private @mean_last_4096(tensor<1x128x4096xf32, #U>) -> tensor<1x128x1xf32, #R>
+  func.func private @add_eps_1e5(tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+  func.func private @rsqrt_row(tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+  func.func private @mul_rows_u(tensor<1x128x4096xf32, #U>, tensor<1x128x1xf32, #R>) -> tensor<1x128x4096xf32, #U>
+  func.func private @mul_weight_bf16(tensor<4096xbf16, #S>, tensor<1x128x4096xbf16, #S>) -> tensor<1x128x4096xbf16, #S>
 
-// KTDF tensor-stage skeleton: helpers stand for stage bodies and transfers.
-// PROPOSED ea.contract attributes transfer the descriptor to non-tensor values.
-// retain/reload are helper FUNCTIONS, not new KTDF operations or FIFO rereads.
-func.func @rms_f32_ktdf(%x: !X32U) -> !X32U {
-  %bx = func.call @retain_X(%x) {ea.contract = #XU} : (!X32U) -> !MX32
-  %xr = func.call @reload_X(%bx) {ea.contract = #XU} : (!MX32) -> !X32U
-  %sq = arith.mulf %xr, %xr : !X32U
-  %v = func.call @mean_hidden_U(%sq) : (!X32U) -> !R32S
-  %eps = arith.constant 1.0e-5 : f32
-  %ve = func.call @add_epsilon_rows(%v, %eps) : (!R32S, f32) -> !R32S
-  %inv = math.rsqrt %ve : !R32S
-  %bi = func.call @retain_R(%inv) {ea.contract = #RS} : (!R32S) -> !MR32
-  // After tiling, reload the matching row scalar for every hidden tile.
-  %xn = func.call @reload_X(%bx) {ea.contract = #XU} : (!MX32) -> !X32U
-  %ri = func.call @reload_R(%bi) {ea.contract = #RS} : (!MR32) -> !R32S
-  %scale = func.call @broadcast_rows_to_hidden(%ri) : (!R32S) -> !X32U
-  %n = arith.mulf %xn, %scale : !X32U
-  return %n : !X32U
+  func.func @granite_ktir(%x: tensor<1x128x4096xbf16, #S>, %w: tensor<4096xbf16, #S>) -> tensor<1x128x4096xbf16, #S> {
+    %xf = "ea.numeric_cast"(%x) {rounding = "exact_extension"} : (tensor<1x128x4096xbf16, #S>) -> tensor<1x128x4096xf32, #U>
+    %sq = func.call @square_u(%xf) : (tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xf32, #U>
+    %mean = func.call @mean_last_4096(%sq) : (tensor<1x128x4096xf32, #U>) -> tensor<1x128x1xf32, #R>
+    %eps = func.call @add_eps_1e5(%mean) : (tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+    %inv = func.call @rsqrt_row(%eps) : (tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+    %norm = func.call @mul_rows_u(%xf, %inv) : (tensor<1x128x4096xf32, #U>, tensor<1x128x1xf32, #R>) -> tensor<1x128x4096xf32, #U>
+    %n16 = "ea.numeric_cast"(%norm) {rounding = "rne"} : (tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xbf16, #S>
+    %y = func.call @mul_weight_bf16(%w, %n16) : (tensor<4096xbf16, #S>, tensor<1x128x4096xbf16, #S>) -> tensor<1x128x4096xbf16, #S>
+    return %y : tensor<1x128x4096xbf16, #S>
+  }
 }
 ```
 
-**A: GraniteRMSNorm.** The eight generated OpSpecs are cast→mul→mean→add→rsqrt→mul→cast→mul. Keep narrowing before weight multiplication.
-
-KTIR (proposed):
+Proposed KTDF (new specification; stage skeleton):
 
 ```mlir
-func.func @granite_ktir(%x: !X16S, %weight: !W16S) -> !X16S {
-  // NEW OP (proposal): numerical cast; logical bf16 -> f32, DL16 storage -> IEEE32.
-  %x32 = "ktdp.numeric_cast"(%x) {src_logical = bf16, dst_logical = f32}
-    : (tensor<128x64x64x!spyreop.df16, #XS>) -> tensor<128x128x32xf32, #XU>
-  %n = func.call @rms_f32_ktir(%x32) : (!X32U) -> !X32U
-  // NEW OP (proposal): round BEFORE weight multiplication; retain this boundary.
-  %h = "ktdp.numeric_cast"(%n) {src_logical = f32, dst_logical = bf16}
-    : (tensor<128x128x32xf32, #XU>) -> tensor<128x64x64x!spyreop.df16, #XS>
-  // Helper contract includes logical bf16 rounding; not native DL16 mul semantics.
-  %y = func.call @weight_mul_bf16(%weight, %h) : (!W16S, !X16S) -> !X16S
-  return %y : !X16S
+// New specification: EA-v1 encoding and ea.numeric_cast / ea.rearrange.
+// Specification helpers: func.call expands to linalg, etc., as defined in the text.
+#S = #ea.layout<S>
+#U = #ea.layout<U>
+#D = #ea.layout<D>
+#R = #ea.layout<R>
+module {
+  func.func private @square_u(tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xf32, #U>
+  func.func private @mean_last_4096(tensor<1x128x4096xf32, #U>) -> tensor<1x128x1xf32, #R>
+  func.func private @add_eps_1e5(tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+  func.func private @rsqrt_row(tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+  func.func private @mul_rows_u(tensor<1x128x4096xf32, #U>, tensor<1x128x1xf32, #R>) -> tensor<1x128x4096xf32, #U>
+  func.func private @mul_weight_bf16(tensor<4096xbf16, #S>, tensor<1x128x4096xbf16, #S>) -> tensor<1x128x4096xbf16, #S>
+
+  func.func @granite_ktdf(%x_slot: !ktdf.fifo.slot<"LXLU" -> "SFP", 524288xbf16>, %w_slot: !ktdf.fifo.slot<"LXLU" -> "SFP", 4096xbf16>, %out0: !ktdf.fifo.slot<"SFP" -> "LXSU", 524288xbf16>) {
+    ktdf.pipeline {
+      ktdf.stage depends_in(none) depends_out(none) {
+        %x = ktdf.read_from_fifo %x_slot {ea.payload = #S} : !ktdf.fifo.slot<"LXLU" -> "SFP", 524288xbf16> -> tensor<1x128x4096xbf16, #S>
+        %w = ktdf.read_from_fifo %w_slot {ea.payload = #S} : !ktdf.fifo.slot<"LXLU" -> "SFP", 4096xbf16> -> tensor<4096xbf16, #S>
+        %xf = "ea.numeric_cast"(%x) {rounding = "exact_extension"} : (tensor<1x128x4096xbf16, #S>) -> tensor<1x128x4096xf32, #U>
+        %sq = func.call @square_u(%xf) : (tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xf32, #U>
+        %mean = func.call @mean_last_4096(%sq) : (tensor<1x128x4096xf32, #U>) -> tensor<1x128x1xf32, #R>
+        %eps = func.call @add_eps_1e5(%mean) : (tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+        %inv = func.call @rsqrt_row(%eps) : (tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+        %norm = func.call @mul_rows_u(%xf, %inv) : (tensor<1x128x4096xf32, #U>, tensor<1x128x1xf32, #R>) -> tensor<1x128x4096xf32, #U>
+        %n16 = "ea.numeric_cast"(%norm) {rounding = "rne"} : (tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xbf16, #S>
+        %y = func.call @mul_weight_bf16(%w, %n16) : (tensor<4096xbf16, #S>, tensor<1x128x4096xbf16, #S>) -> tensor<1x128x4096xbf16, #S>
+        ktdf.write_to_fifo %y, %out0 {ea.payload = #S} : tensor<1x128x4096xbf16, #S>, !ktdf.fifo.slot<"SFP" -> "LXSU", 524288xbf16>
+      }
+    }
+    return
+  }
 }
 ```
 
-KTDF tensor stage (proposed; stage bodies omitted):
+#### B: GptOss RMSNorm
+
+Proposed KTIR (new specification):
 
 ```mlir
-func.func @granite_ktdf_tensor(%x: !X16S, %weight: !W16S) -> !X16S {
-  // Helpers contain the numerical-cast stages with the same contracts as KTIR.
-  %x32 = func.call @upcast_X_stage(%x) : (!X16S) -> !X32U
-  %n = func.call @rms_f32_ktdf(%x32) : (!X32U) -> !X32U
-  %h = func.call @narrow_X_stage(%n) : (!X32U) -> !X16S
-  %y = func.call @weight_mul_bf16(%weight, %h) : (!W16S, !X16S) -> !X16S
-  return %y : !X16S
+// New specification: EA-v1 encoding and ea.numeric_cast / ea.rearrange.
+// Specification helpers: func.call expands to linalg, etc., as defined in the text.
+#S = #ea.layout<S>
+#U = #ea.layout<U>
+#D = #ea.layout<D>
+#R = #ea.layout<R>
+module {
+  func.func private @square_u(tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xf32, #U>
+  func.func private @mean_last_4096(tensor<1x128x4096xf32, #U>) -> tensor<1x128x1xf32, #R>
+  func.func private @add_eps_1e5(tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+  func.func private @rsqrt_row(tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+  func.func private @mul_rows_u(tensor<1x128x4096xf32, #U>, tensor<1x128x1xf32, #R>) -> tensor<1x128x4096xf32, #U>
+  func.func private @mul_weight_f32(tensor<4096xf32, #U>, tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xf32, #U>
+
+  func.func @gpt_oss_ktir(%x: tensor<1x128x4096xbf16, #S>, %w: tensor<4096xbf16, #S>) -> tensor<1x128x4096xbf16, #S> {
+    %xf = "ea.numeric_cast"(%x) {rounding = "exact_extension"} : (tensor<1x128x4096xbf16, #S>) -> tensor<1x128x4096xf32, #U>
+    %sq = func.call @square_u(%xf) : (tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xf32, #U>
+    %mean = func.call @mean_last_4096(%sq) : (tensor<1x128x4096xf32, #U>) -> tensor<1x128x1xf32, #R>
+    %eps = func.call @add_eps_1e5(%mean) : (tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+    %inv = func.call @rsqrt_row(%eps) : (tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+    %norm = func.call @mul_rows_u(%xf, %inv) : (tensor<1x128x4096xf32, #U>, tensor<1x128x1xf32, #R>) -> tensor<1x128x4096xf32, #U>
+    %wf = "ea.numeric_cast"(%w) {rounding = "exact_extension"} : (tensor<4096xbf16, #S>) -> tensor<4096xf32, #U>
+    %weighted = func.call @mul_weight_f32(%wf, %norm) : (tensor<4096xf32, #U>, tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xf32, #U>
+    %y = "ea.numeric_cast"(%weighted) {rounding = "rne"} : (tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xbf16, #S>
+    return %y : tensor<1x128x4096xbf16, #S>
+  }
 }
 ```
 
-`weight_mul_bf16` is a helper contract including logical bf16 rounding; equivalence to native DL16 multiplication remains unproven. Zero additional pure EA transformations is a candidate if computation in U and the reverse cast can return to S.
-
-**B: GptOssRMSNorm.** The nine generated OpSpecs include promotion of the weight to f32. KTIR shows the numerical graph; the KTDF example shows the repair using separate kernels/functions.
-
-KTIR (proposed):
+Proposed KTDF (new specification; stage skeleton):
 
 ```mlir
-func.func @gpt_oss_ktir(%x: !X16S, %weight: !W16S) -> !X16S {
-  // NEW OP (proposal): numerical bf16 -> f32 cast, not restickify.
-  %x32 = "ktdp.numeric_cast"(%x) {src_logical = bf16, dst_logical = f32}
-    : (!X16S) -> !X32U
-  %n = func.call @rms_f32_ktir(%x32) : (!X32U) -> !X32U
-  // NEW OP (proposal): promote WEIGHT as required by the original multiplication.
-  %w32 = "ktdp.numeric_cast"(%weight) {src_logical = bf16, dst_logical = f32}
-    : (tensor<64x64x!spyreop.df16, #WS>) -> tensor<128x32xf32, #WU>
-  %wb = func.call @broadcast_weight_U(%w32) : (!W32U) -> !X32U
-  %p = arith.mulf %n, %wb : !X32U
-  // NEW OP (proposal): round AFTER weight multiplication.
-  %y = "ktdp.numeric_cast"(%p) {src_logical = f32, dst_logical = bf16}
-    : (!X32U) -> !X16S
-  return %y : !X16S
+// New specification: EA-v1 encoding and ea.numeric_cast / ea.rearrange.
+// Specification helpers: func.call expands to linalg, etc., as defined in the text.
+#S = #ea.layout<S>
+#U = #ea.layout<U>
+#D = #ea.layout<D>
+#R = #ea.layout<R>
+module {
+  func.func private @square_u(tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xf32, #U>
+  func.func private @mean_last_4096(tensor<1x128x4096xf32, #U>) -> tensor<1x128x1xf32, #R>
+  func.func private @add_eps_1e5(tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+  func.func private @rsqrt_row(tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+  func.func private @mul_rows_u(tensor<1x128x4096xf32, #U>, tensor<1x128x1xf32, #R>) -> tensor<1x128x4096xf32, #U>
+  func.func private @mul_weight_f32(tensor<4096xf32, #U>, tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xf32, #U>
+
+  func.func @gpt_oss_ktdf(%x_slot: !ktdf.fifo.slot<"LXLU" -> "SFP", 524288xbf16>, %w_slot: !ktdf.fifo.slot<"LXLU" -> "SFP", 4096xbf16>, %out0: !ktdf.fifo.slot<"SFP" -> "LXSU", 524288xbf16>) {
+    ktdf.pipeline {
+      ktdf.stage depends_in(none) depends_out(none) {
+        %x = ktdf.read_from_fifo %x_slot {ea.payload = #S} : !ktdf.fifo.slot<"LXLU" -> "SFP", 524288xbf16> -> tensor<1x128x4096xbf16, #S>
+        %w = ktdf.read_from_fifo %w_slot {ea.payload = #S} : !ktdf.fifo.slot<"LXLU" -> "SFP", 4096xbf16> -> tensor<4096xbf16, #S>
+        %xf = "ea.numeric_cast"(%x) {rounding = "exact_extension"} : (tensor<1x128x4096xbf16, #S>) -> tensor<1x128x4096xf32, #U>
+        %sq = func.call @square_u(%xf) : (tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xf32, #U>
+        %mean = func.call @mean_last_4096(%sq) : (tensor<1x128x4096xf32, #U>) -> tensor<1x128x1xf32, #R>
+        %eps = func.call @add_eps_1e5(%mean) : (tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+        %inv = func.call @rsqrt_row(%eps) : (tensor<1x128x1xf32, #R>) -> tensor<1x128x1xf32, #R>
+        %norm = func.call @mul_rows_u(%xf, %inv) : (tensor<1x128x4096xf32, #U>, tensor<1x128x1xf32, #R>) -> tensor<1x128x4096xf32, #U>
+        %wf = "ea.numeric_cast"(%w) {rounding = "exact_extension"} : (tensor<4096xbf16, #S>) -> tensor<4096xf32, #U>
+        %weighted = func.call @mul_weight_f32(%wf, %norm) : (tensor<4096xf32, #U>, tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xf32, #U>
+        %y = "ea.numeric_cast"(%weighted) {rounding = "rne"} : (tensor<1x128x4096xf32, #U>) -> tensor<1x128x4096xbf16, #S>
+        ktdf.write_to_fifo %y, %out0 {ea.payload = #S} : tensor<1x128x4096xbf16, #S>, !ktdf.fifo.slot<"SFP" -> "LXSU", 524288xbf16>
+      }
+    }
+    return
+  }
 }
 ```
 
-KTDF tensor stage (proposed; stage bodies omitted):
+#### C: RoPE
+
+Proposed KTIR (new specification):
 
 ```mlir
-// Separate kernel/function 0, with its own grid and buffer owner.
-// PROPOSED result contract: preserve EA across the separate-kernel ABI.
-func.func @gpt_weight_prepare_ktdf(%weight: !W16S) -> (!MW32 {ea.contract = #WU}) {
-  %w32 = func.call @upcast_W_stage(%weight) : (!W16S) -> !W32U
-  %bw = func.call @retain_W(%w32) {ea.contract = #WU} : (!W32U) -> !MW32
-  return %bw : !MW32
-}
-// Separate kernel/function 1. Launch only AFTER kernel 0 completes.
-// Runtime launch/completion synchronization is required and omitted here;
-// func.call alone is NOT a device-kernel launch or a completion barrier.
-// PROPOSED argument contract: must match the completed producer buffer.
-func.func @gpt_oss_ktdf_tensor(%x: !X16S, %ready_weight: !MW32 {ea.contract = #WU}) -> !X16S {
-  %x32 = func.call @upcast_X_stage(%x) : (!X16S) -> !X32U
-  %n = func.call @rms_f32_ktdf(%x32) : (!X32U) -> !X32U
-  // Independent channel/load per activation tile; do not reuse a consumed FIFO.
-  %w32 = func.call @reload_W(%ready_weight) {ea.contract = #WU} : (!MW32) -> !W32U
-  %wb = func.call @broadcast_weight_U(%w32) : (!W32U) -> !X32U
-  %p = arith.mulf %n, %wb : !X32U
-  %y = func.call @narrow_X_stage(%p) : (!X32U) -> !X16S
-  return %y : !X16S
-}
-```
+// New specification: EA-v1 encoding and ea.numeric_cast / ea.rearrange.
+// Specification helpers: func.call expands to linalg, etc., as defined in the text.
+#S = #ea.layout<S>
+#U = #ea.layout<U>
+#D = #ea.layout<D>
+#R = #ea.layout<R>
+module {
+  func.func private @outer_freq(tensor<1x128xf32, #S>, tensor<64xf32, #S>) -> tensor<1x128x64xf32, #S>
+  func.func private @duplicate_last(tensor<1x128x64xf32, #S>) -> tensor<1x128x128xf32, #S>
+  func.func private @cos_f32(tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
+  func.func private @sin_f32(tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
+  func.func private @scale_one(tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
 
-Separate weight preparation requires buffer ownership and completion synchronization; splitting stages within one kernel does not bypass the single-grid check. If additional EA repair is needed, compare W=4096 against activation X=524288, but choosing the smaller side does not establish ownership/broadcast legality. On the CPU, `u=1.00390625f32,w=1.5bf16` gives 1.5 for A and 1.5078125 for B, so no rewrite aligns their cast positions.
-
-**C: RoPE.** The current implementation stopped before OpSpec generation. This proposes the required processing, preserving logical i64 positions (device i32), f32 inv_freq, and the bf16 dtype/device supplied by x.
-
-KTIR (proposed):
-
-```mlir
-// x supplies the bf16 output dtype/device only; its tensor values are unused.
-// position is logically i64; transfer stores i32. Fixed values 0..127 are exact.
-func.func @rope_ktir(%x: !X16S, %position: !P0I, %inv_freq: !IF) -> (!E16S, !E16S) {
-  // Existing func.call to a view helper: logical [1,128] -> [1,128,1].
-  %pv = func.call @unsqueeze_position(%position) : (!P0I) -> !P1I
-  // NEW OP (proposal): numerical conversion after unsqueeze, storage i32 -> f32.
-  %p32 = "ktdp.numeric_cast"(%pv) {src_logical = i64, dst_logical = f32,
-    input_range = array<i64: 0, 127>} : (!P1I) -> !P1F
-  // Helper for checked geometry restickify, NOT an EA-only relabel or a new op.
-  %pa = func.call @restick_position_to_frequency_axis(%p32) : (!P1F) -> !PBF
-  %f = func.call @position_frequency_mul(%pa, %inv_freq) : (!PBF, !IF) -> !F32S
-  %e = func.call @concat_last(%f, %f) : (!F32S, !F32S) -> !E32S
-  %c = math.cos %e : !E32S
-  %s = math.sin %e : !E32S
-  // NEW OP (proposal): preserve the original cos-result rounding position.
-  %c16 = "ktdp.numeric_cast"(%c) {src_logical = f32, dst_logical = bf16}
-    : (!E32S) -> !E16D
-  // NEW OP (proposal): preserve the original sin-result rounding position.
-  %s16 = "ktdp.numeric_cast"(%s) {src_logical = f32, dst_logical = bf16}
-    : (!E32S) -> !E16D
-  // NEW OP (proposal): same element type/logical shape; change EA only.
-  %co = "ktdp.convert_ea"(%c16)
-    : (tensor<1x2x128x64x!spyreop.df16, #ED16>) -> tensor<1x2x128x64x!spyreop.df16, #ES16>
-  // NEW OP (proposal): same pure EA transformation for the other output.
-  %so = "ktdp.convert_ea"(%s16) : (!E16D) -> !E16S
-  return %co, %so : !E16S, !E16S
+  func.func @rope_ktir(%positions: tensor<1x128xi32, #S>, %inv_freq: tensor<64xf32, #S>) -> (tensor<1x128x128xbf16, #S>, tensor<1x128x128xbf16, #S>) {
+    %pf = "ea.numeric_cast"(%positions) {rounding = "rne", signedness = "signed"} : (tensor<1x128xi32, #S>) -> tensor<1x128xf32, #S>
+    %freqs = func.call @outer_freq(%pf, %inv_freq) : (tensor<1x128xf32, #S>, tensor<64xf32, #S>) -> tensor<1x128x64xf32, #S>
+    %emb = func.call @duplicate_last(%freqs) : (tensor<1x128x64xf32, #S>) -> tensor<1x128x128xf32, #S>
+    %cv = func.call @cos_f32(%emb) : (tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
+    %sv = func.call @sin_f32(%emb) : (tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
+    %cs = func.call @scale_one(%cv) : (tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
+    %ss = func.call @scale_one(%sv) : (tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
+    %cd = "ea.numeric_cast"(%cs) {rounding = "rne"} : (tensor<1x128x128xf32, #S>) -> tensor<1x128x128xbf16, #D>
+    %sd = "ea.numeric_cast"(%ss) {rounding = "rne"} : (tensor<1x128x128xf32, #S>) -> tensor<1x128x128xbf16, #D>
+    %co = "ea.rearrange"(%cd) : (tensor<1x128x128xbf16, #D>) -> tensor<1x128x128xbf16, #S>
+    %so = "ea.rearrange"(%sd) : (tensor<1x128x128xbf16, #D>) -> tensor<1x128x128xbf16, #S>
+    return %co, %so : tensor<1x128x128xbf16, #S>, tensor<1x128x128xbf16, #S>
+  }
 }
 ```
 
-KTDF tensor stage (proposed; stage bodies omitted):
+Proposed KTDF (new specification; stage skeleton):
 
 ```mlir
-func.func @rope_ktdf_tensor(%position: !P0I, %inv_freq: !IF) -> (!E16S, !E16S) {
-  %pv = func.call @unsqueeze_position(%position) : (!P0I) -> !P1I
-  %p32 = func.call @position_cast_stage(%pv) : (!P1I) -> !P1F
-  %pa = func.call @restick_position_to_frequency_axis(%p32) : (!P1F) -> !PBF
-  %f = func.call @position_frequency_mul(%pa, %inv_freq) : (!PBF, !IF) -> !F32S
-  %bf = func.call @retain_F(%f) {ea.contract = #FS} : (!F32S) -> !MF32
-  // Two independent loads/channels for the two concat operands.
-  %f0 = func.call @reload_F(%bf) {ea.contract = #FS} : (!MF32) -> !F32S
-  %f1 = func.call @reload_F(%bf) {ea.contract = #FS} : (!MF32) -> !F32S
-  %e = func.call @concat_last(%f0, %f1) : (!F32S, !F32S) -> !E32S
-  %be = func.call @retain_E(%e) {ea.contract = #ES32} : (!E32S) -> !ME32
-  %ec = func.call @reload_E(%be) {ea.contract = #ES32} : (!ME32) -> !E32S
-  %es = func.call @reload_E(%be) {ea.contract = #ES32} : (!ME32) -> !E32S
-  %c = math.cos %ec : !E32S
-  %s = math.sin %es : !E32S
-  %c16 = func.call @narrow_E_stage(%c) : (!E32S) -> !E16D
-  %s16 = func.call @narrow_E_stage(%s) : (!E32S) -> !E16D
-  // NEW OP (proposal): keep the EA obligation until existing transfers/shuffles realize it.
-  %co = "ktdf.convert_ea"(%c16) : (!E16D) -> !E16S
-  // NEW OP (proposal): no numerical conversion at this operation.
-  %so = "ktdf.convert_ea"(%s16) : (!E16D) -> !E16S
-  return %co, %so : !E16S, !E16S
+// New specification: EA-v1 encoding and ea.numeric_cast / ea.rearrange.
+// Specification helpers: func.call expands to linalg, etc., as defined in the text.
+#S = #ea.layout<S>
+#U = #ea.layout<U>
+#D = #ea.layout<D>
+#R = #ea.layout<R>
+module {
+  func.func private @outer_freq(tensor<1x128xf32, #S>, tensor<64xf32, #S>) -> tensor<1x128x64xf32, #S>
+  func.func private @duplicate_last(tensor<1x128x64xf32, #S>) -> tensor<1x128x128xf32, #S>
+  func.func private @cos_f32(tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
+  func.func private @sin_f32(tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
+  func.func private @scale_one(tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
+
+  func.func @rope_ktdf(%positions_slot: !ktdf.fifo.slot<"LXLU" -> "SFP", 128xi32>, %inv_freq_slot: !ktdf.fifo.slot<"LXLU" -> "SFP", 64xf32>, %out0: !ktdf.fifo.slot<"SFP" -> "LXSU", 16384xbf16>, %out1: !ktdf.fifo.slot<"SFP" -> "LXSU", 16384xbf16>) {
+    ktdf.pipeline {
+      ktdf.stage depends_in(none) depends_out(none) {
+        %positions = ktdf.read_from_fifo %positions_slot {ea.payload = #S} : !ktdf.fifo.slot<"LXLU" -> "SFP", 128xi32> -> tensor<1x128xi32, #S>
+        %inv_freq = ktdf.read_from_fifo %inv_freq_slot {ea.payload = #S} : !ktdf.fifo.slot<"LXLU" -> "SFP", 64xf32> -> tensor<64xf32, #S>
+        %pf = "ea.numeric_cast"(%positions) {rounding = "rne", signedness = "signed"} : (tensor<1x128xi32, #S>) -> tensor<1x128xf32, #S>
+        %freqs = func.call @outer_freq(%pf, %inv_freq) : (tensor<1x128xf32, #S>, tensor<64xf32, #S>) -> tensor<1x128x64xf32, #S>
+        %emb = func.call @duplicate_last(%freqs) : (tensor<1x128x64xf32, #S>) -> tensor<1x128x128xf32, #S>
+        %cv = func.call @cos_f32(%emb) : (tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
+        %sv = func.call @sin_f32(%emb) : (tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
+        %cs = func.call @scale_one(%cv) : (tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
+        %ss = func.call @scale_one(%sv) : (tensor<1x128x128xf32, #S>) -> tensor<1x128x128xf32, #S>
+        %cd = "ea.numeric_cast"(%cs) {rounding = "rne"} : (tensor<1x128x128xf32, #S>) -> tensor<1x128x128xbf16, #D>
+        %sd = "ea.numeric_cast"(%ss) {rounding = "rne"} : (tensor<1x128x128xf32, #S>) -> tensor<1x128x128xbf16, #D>
+        %co = "ea.rearrange"(%cd) : (tensor<1x128x128xbf16, #D>) -> tensor<1x128x128xbf16, #S>
+        %so = "ea.rearrange"(%sd) : (tensor<1x128x128xbf16, #D>) -> tensor<1x128x128xbf16, #S>
+        ktdf.write_to_fifo %co, %out0 {ea.payload = #S} : tensor<1x128x128xbf16, #S>, !ktdf.fifo.slot<"SFP" -> "LXSU", 16384xbf16>
+        ktdf.write_to_fifo %so, %out1 {ea.payload = #S} : tensor<1x128x128xbf16, #S>, !ktdf.fifo.slot<"SFP" -> "LXSU", 16384xbf16>
+      }
+    }
+    return
+  }
 }
 ```
 
-`restick_position_to_frequency_axis` is a helper for geometry conversion, not merely an order change. `math.cos/sin` show the required numerical processing; current decomposition primitives, approximation error, and backend support still require validation. Arranging the f32 side before narrowing is an alternative only when the composed maps and numerical semantics agree, without moving the cast before trigonometric operations.
+#### D: fp32 Softmax
 
-**D: Softmax.** The six generated OpSpecs are upcast→max→sub→exp→sum→realdiv. Restore S at the exit through a same-dtype EA transformation.
-
-KTIR (proposed):
+Proposed KTIR (new specification):
 
 ```mlir
-func.func @router_softmax_ktir(%logits: !Q16S) -> !Q32S {
-  // NEW OP (proposal): numerical bf16 -> f32 cast, retaining its induced EA.
-  %u = "ktdp.numeric_cast"(%logits) {src_logical = bf16, dst_logical = f32}
-    : (tensor<2x128x64x!spyreop.df16, #QS16>) -> tensor<4x128x32xf32, #QU32>
-  %m = func.call @max_last_U(%u) : (!Q32U) -> !M32S
-  %mb = func.call @broadcast_last_U(%m) : (!M32S) -> !Q32U
-  %a = arith.subf %u, %mb : !Q32U
-  %e = math.exp %a : !Q32U
-  %z = func.call @sum_last_U(%e) : (!Q32U) -> !M32S
-  %zb = func.call @broadcast_last_U(%z) : (!M32S) -> !Q32U
-  %p = arith.divf %e, %zb : !Q32U
-  // NEW OP (proposal): f32 -> f32; only the encoding changes, with actual movement as needed.
-  %out = "ktdp.convert_ea"(%p)
-    : (tensor<4x128x32xf32, #QU32>) -> tensor<4x128x32xf32, #QS32>
-  return %out : !Q32S
+// New specification: EA-v1 encoding and ea.numeric_cast / ea.rearrange.
+// Specification helpers: func.call expands to linalg, etc., as defined in the text.
+#S = #ea.layout<S>
+#U = #ea.layout<U>
+#D = #ea.layout<D>
+#R = #ea.layout<R>
+module {
+  func.func private @max_last_128(tensor<128x128xf32, #U>) -> tensor<128x1xf32, #R>
+  func.func private @sub_rows(tensor<128x128xf32, #U>, tensor<128x1xf32, #R>) -> tensor<128x128xf32, #U>
+  func.func private @exp_f32(tensor<128x128xf32, #U>) -> tensor<128x128xf32, #U>
+  func.func private @sum_last_128(tensor<128x128xf32, #U>) -> tensor<128x1xf32, #R>
+  func.func private @div_rows(tensor<128x128xf32, #U>, tensor<128x1xf32, #R>) -> tensor<128x128xf32, #U>
+
+  func.func @softmax_ktir(%x: tensor<128x128xbf16, #S>) -> tensor<128x128xf32, #S> {
+    %xf = "ea.numeric_cast"(%x) {rounding = "exact_extension"} : (tensor<128x128xbf16, #S>) -> tensor<128x128xf32, #U>
+    %mx = func.call @max_last_128(%xf) : (tensor<128x128xf32, #U>) -> tensor<128x1xf32, #R>
+    %shifted = func.call @sub_rows(%xf, %mx) : (tensor<128x128xf32, #U>, tensor<128x1xf32, #R>) -> tensor<128x128xf32, #U>
+    %ex = func.call @exp_f32(%shifted) : (tensor<128x128xf32, #U>) -> tensor<128x128xf32, #U>
+    %sum = func.call @sum_last_128(%ex) : (tensor<128x128xf32, #U>) -> tensor<128x1xf32, #R>
+    %prob = func.call @div_rows(%ex, %sum) : (tensor<128x128xf32, #U>, tensor<128x1xf32, #R>) -> tensor<128x128xf32, #U>
+    %y = "ea.rearrange"(%prob) : (tensor<128x128xf32, #U>) -> tensor<128x128xf32, #S>
+    return %y : tensor<128x128xf32, #S>
+  }
 }
 ```
 
-KTDF tensor stage (proposed; stage bodies omitted):
+Proposed KTDF (new specification; stage skeleton):
 
 ```mlir
-func.func @router_softmax_ktdf_tensor(%logits: !Q16S) -> !Q32S {
-  %u = func.call @upcast_Q_stage(%logits) : (!Q16S) -> !Q32U
-  %bu = func.call @retain_Q(%u) {ea.contract = #QU32} : (!Q32U) -> !MQ32
-  %um = func.call @reload_Q(%bu) {ea.contract = #QU32} : (!MQ32) -> !Q32U
-  %us = func.call @reload_Q(%bu) {ea.contract = #QU32} : (!MQ32) -> !Q32U
-  %m = func.call @max_last_U(%um) : (!Q32U) -> !M32S
-  %mb = func.call @broadcast_last_U(%m) : (!M32S) -> !Q32U
-  %a = arith.subf %us, %mb : !Q32U
-  %e = math.exp %a : !Q32U
-  %be = func.call @retain_Q(%e) {ea.contract = #QU32} : (!Q32U) -> !MQ32
-  %ez = func.call @reload_Q(%be) {ea.contract = #QU32} : (!MQ32) -> !Q32U
-  %ep = func.call @reload_Q(%be) {ea.contract = #QU32} : (!MQ32) -> !Q32U
-  %z = func.call @sum_last_U(%ez) : (!Q32U) -> !M32S
-  %zb = func.call @broadcast_last_U(%z) : (!M32S) -> !Q32U
-  %p = arith.divf %ep, %zb : !Q32U
-  // NEW OP (proposal): lower into existing DFIR memory/transfer/shuffle operations.
-  %out = "ktdf.convert_ea"(%p) : (!Q32U) -> !Q32S
-  return %out : !Q32S
+// New specification: EA-v1 encoding and ea.numeric_cast / ea.rearrange.
+// Specification helpers: func.call expands to linalg, etc., as defined in the text.
+#S = #ea.layout<S>
+#U = #ea.layout<U>
+#D = #ea.layout<D>
+#R = #ea.layout<R>
+module {
+  func.func private @max_last_128(tensor<128x128xf32, #U>) -> tensor<128x1xf32, #R>
+  func.func private @sub_rows(tensor<128x128xf32, #U>, tensor<128x1xf32, #R>) -> tensor<128x128xf32, #U>
+  func.func private @exp_f32(tensor<128x128xf32, #U>) -> tensor<128x128xf32, #U>
+  func.func private @sum_last_128(tensor<128x128xf32, #U>) -> tensor<128x1xf32, #R>
+  func.func private @div_rows(tensor<128x128xf32, #U>, tensor<128x1xf32, #R>) -> tensor<128x128xf32, #U>
+
+  func.func @softmax_ktdf(%x_slot: !ktdf.fifo.slot<"LXLU" -> "SFP", 16384xbf16>, %out0: !ktdf.fifo.slot<"SFP" -> "LXSU", 16384xf32>) {
+    ktdf.pipeline {
+      ktdf.stage depends_in(none) depends_out(none) {
+        %x = ktdf.read_from_fifo %x_slot {ea.payload = #S} : !ktdf.fifo.slot<"LXLU" -> "SFP", 16384xbf16> -> tensor<128x128xbf16, #S>
+        %xf = "ea.numeric_cast"(%x) {rounding = "exact_extension"} : (tensor<128x128xbf16, #S>) -> tensor<128x128xf32, #U>
+        %mx = func.call @max_last_128(%xf) : (tensor<128x128xf32, #U>) -> tensor<128x1xf32, #R>
+        %shifted = func.call @sub_rows(%xf, %mx) : (tensor<128x128xf32, #U>, tensor<128x1xf32, #R>) -> tensor<128x128xf32, #U>
+        %ex = func.call @exp_f32(%shifted) : (tensor<128x128xf32, #U>) -> tensor<128x128xf32, #U>
+        %sum = func.call @sum_last_128(%ex) : (tensor<128x128xf32, #U>) -> tensor<128x1xf32, #R>
+        %prob = func.call @div_rows(%ex, %sum) : (tensor<128x128xf32, #U>, tensor<128x1xf32, #R>) -> tensor<128x128xf32, #U>
+        %y = "ea.rearrange"(%prob) : (tensor<128x128xf32, #U>) -> tensor<128x128xf32, #S>
+        ktdf.write_to_fifo %y, %out0 {ea.payload = #S} : tensor<128x128xf32, #S>, !ktdf.fifo.slot<"SFP" -> "LXSU", 16384xf32>
+      }
+    }
+    return
+  }
 }
 ```
 
-The final transformation keeps f32 and the same shape, changing the encoding from U to S. It must still perform any necessary data movement, not merely rewrite an attribute. Adding fp32→DL16→fp32 to restore EA is prohibited. Design acceptance requires f32 output independently of the original script’s `check_dtype=False`.
+Acceptance criteria for the four examples: compare A and B separately against their own CPU results with atol = rtol = 0.1; compare C's cos and sin separately with 0.02/0.02; and compare D with 0.001/0.01. Check bf16 outputs for A/B/C and an f32 output for D separately. Preserve the original shapes, seeds, bf16 inputs and weights, C's f32 inv_freq and int64 positions, and dynamic=False. The original check_dtype=False in D does not justify dropping its f32 output requirement.
 
-**Additional FIFO-boundary example.** This is a separate single tile, not the full shapes above. It distinguishes existing read/write ops from the proposed encoding/contracts. `64xf32` specifies FIFO element count and element type, not EA. A verifier must check endpoints, ownership, and tile maps. FIFO and tensor element counts/types must also agree. Adding attributes to existing ops alone does not implement support; encoding-aware verifiers, builders, and bufferization are required.[D1][D6]
+All eight proposed modules passed parsing, SSA type checks, existing KTDF verifiers, and round-trip checks with an empty pipeline and unknown dialects allowed. Semantic verifiers for the new ea.* constructs, actual helper lowering, and device execution remain unimplemented and unverified.
 
-```mlir
-// Separate one-tile adapter example; endpoint names are illustrative.
-// Existing FIFO type has element count/type, NOT RankedTensorType encoding.
-#tile_U = {order = "DL16_TO_FP32", map_ref = "tile.U32", valid_ref = "all"}
-!TileU = tensor<2x32xf32, #tile_U>
-!In = !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf32>
-!Out = !ktdf.fifo.slot<"SFU" -> "L1LU", 64xf32>
-// PROPOSED argument contracts: verify against channel endpoints and owners.
-func.func @checked_tile_adapter(%in: !In {ea.contract = #tile_U},
-                                %out: !Out {ea.contract = #tile_U}) {
-  // EXISTING op; PROPOSED ea.contract attribute + encoding-aware verification.
-  %v = "ktdf.read_from_fifo"(%in) {ea.contract = #tile_U} : (!In) -> !TileU
-  // EXISTING op; PROPOSED contract must agree with the output channel/owner.
-  "ktdf.write_to_fifo"(%v, %out) {ea.contract = #tile_U} : (!TileU, !Out) -> ()
-  return
-}
-```
-
-**Typed helper declarations.** Place these declarations in the same module as the common aliases. They make `func.call` input/output types traceable, but declarations do not implement the bodies or lowering. Helpers must be inlined/expanded into computation, stages, and transfers before entering the current scheduler path. Retain/reload contracts require owned buffers, completion synchronization, per-use channels, and correct row/tile selection; later passes must not treat them as pure functions eligible for unconditional CSE. Numerical-cast helpers preserve original rounding positions, logical dtypes, and storage formats; buffer loads restore the corresponding tensor encoding. Argument, result, and call-site `ea.contract` attributes must agree with producer/owner contracts; adding an attribute cannot establish EA for an arbitrary buffer. D’s `max_last_U/sum_last_U` reduce all 128 logical experts per row, not just the physical trailing 32 elements. Preserve masks, fp32 accumulation, original order, and NaN/identity semantics.
-
-```mlir
-// Explanatory helper symbols, not new ops. Bodies must be expanded before scheduling.
-// PROPOSED argument/result contracts below bind memrefs to producer/owner EA.
-func.func private @mean_hidden_U(!X32U) -> !R32S
-func.func private @add_epsilon_rows(!R32S, f32) -> !R32S
-func.func private @broadcast_rows_to_hidden(!R32S) -> !X32U
-func.func private @weight_mul_bf16(!W16S, !X16S) -> !X16S
-func.func private @broadcast_weight_U(!W32U) -> !X32U
-func.func private @unsqueeze_position(!P0I) -> !P1I
-func.func private @restick_position_to_frequency_axis(!P1F) -> !PBF
-func.func private @position_frequency_mul(!PBF, !IF) -> !F32S
-func.func private @concat_last(!F32S, !F32S) -> !E32S
-func.func private @max_last_U(!Q32U) -> !M32S
-func.func private @sum_last_U(!Q32U) -> !M32S
-func.func private @broadcast_last_U(!M32S) -> !Q32U
-func.func private @upcast_X_stage(!X16S) -> !X32U
-func.func private @narrow_X_stage(!X32U) -> !X16S
-func.func private @upcast_W_stage(!W16S) -> !W32U
-func.func private @position_cast_stage(!P1I) -> !P1F
-func.func private @narrow_E_stage(!E32S) -> !E16D
-func.func private @upcast_Q_stage(!Q16S) -> !Q32U
-func.func private @retain_X(!X32U) -> (!MX32 {ea.contract = #XU})
-func.func private @reload_X(!MX32 {ea.contract = #XU}) -> !X32U
-func.func private @retain_R(!R32S) -> (!MR32 {ea.contract = #RS})
-func.func private @reload_R(!MR32 {ea.contract = #RS}) -> !R32S
-func.func private @retain_W(!W32U) -> (!MW32 {ea.contract = #WU})
-func.func private @reload_W(!MW32 {ea.contract = #WU}) -> !W32U
-func.func private @retain_F(!F32S) -> (!MF32 {ea.contract = #FS})
-func.func private @reload_F(!MF32 {ea.contract = #FS}) -> !F32S
-func.func private @retain_E(!E32S) -> (!ME32 {ea.contract = #ES32})
-func.func private @reload_E(!ME32 {ea.contract = #ES32}) -> !E32S
-func.func private @retain_Q(!Q32U) -> (!MQ32 {ea.contract = #QU32})
-func.func private @reload_Q(!MQ32 {ea.contract = #QU32}) -> !Q32U
-```
-
-All candidates use the same numerical graphs above. KTIR-only designs must materialize EA at the KTDF entry; EA-P003/P004 retain the illustrated contracts through KTDF. Unresolved shape, map, or cast contracts prevent declaring these examples implementable. The prohibition on adding instructions or attributes to final Dataflow remains in force.
-
-**Syntax check for this revision (2026-10-26):** the combined aliases, helper declarations, and four examples passed the installed mlir_ktdp parser/verifier after temporarily renaming only the three proposed operation kinds into the unregistered `ea_doc` namespace. This checked shape/element-type/encoding notation, SSA, existing arith/math operations, and func.call type consistency. The original `ktdp.numeric_cast` name is rejected as unregistered. This does not validate EA maps, new-op semantics, helper bodies, KTDF scheduling, Dataflow lowering, or execution of the four examples, and does not update the report’s historical execution results. The FIFO adapter also passed parse/verify with `dbo-opt --allow-unregistered-dialect`, which registers existing KTDF, without running passes; this does not validate the meaning or preservation of the new `ea.contract`.
-
-## 2. Overall Policy and Processing Overview
-
-### 2.1 Confirmed Path and Information Preservation
+## 2. Overall Approach and Processing Overview
 
 ```mermaid
 flowchart LR
-  O[OpSpec: device placement + EA] --> K[KTIR: KTDP / Linalg etc.]
-  K --> B[dbo-opt --from-ktir]
-  B --> T[KTDF Schedule IR]
-  T --> L[KTDFLow]
-  L --> D[Existing Dataflow / Agen / VectorChain]
-  E[Proposal: EA descriptor + convert_ea] -. preserve .-> K
-  E -. preserve and select resources .-> T
-  E -. materialize and eliminate EA abstractions .-> L
+  A[Common layout/EA propagation] --> B[OpSpec]
+  B --> C[KTIR / tensor encoding, cast, and rearrange]
+  C --> D[KTDF / tensor, buffer, and FIFO contracts]
+  D --> E[Select resources/tiles / finalize plan before allocation]
+  E --> F[Existing DFIR / address, transfer, shuffle, and cast]
 ```
 
-Solid lines are confirmed by source code and generated addition artifacts; dotted lines are proposed. This diagram does not show completed paths for the four examples. `TORCH_SPYRE_KTIR` is enabled when it equals `"1"` at import time, and `SuperDSCScheduling.define_kernel` selects `async_compile.ktir`. KTIR is a language comprising multiple dialects, not an alias for KTDP alone. Triton is a separate producer and does not occur within the direct OpSpec path.[TS1][TS2][TS15][KF1]
+The EA-v1 portions of the diagram are proposals. The current route connects config → scheduler.define_kernel → SpyreAsyncCompile.ktir → generate_ktir → `.ktir`. KTIR combines KTDP, standard dialects, and SpyreOp; this route does not go through Triton. dataflow-scheduler-mlir-dialects owns the KTDF/DFIR definitions, while dataflow-scheduler owns conversion and scheduling.[S1b][S2][D1]
 
-| Stage | Information preserved / selected | Responsibilities for changes and verification |
-| --- | --- | --- |
-| OpSpec | Already selected device geometry/EA, allocation, grid, and numerical cast provenance | Strengthen correspondence to logical dtype/shape. Do not change actual data placement merely by changing its description |
-| KTIR | Actual EA, use requirements, and pure EA transformations; candidate sets reside in the analysis | Fix cast semantics and select legal transformations for pointwise operations/fanout. Separate physical shape from the logical map |
-| KTDF tensor/FIFO | Transfer the same descriptor from tensor encoding into slot/read/write contracts | Preserve it through bufferization, cloning, and retiling; check broadcast, reduction, and ownership |
-| KTDF scheduling | Resources, transfer granularity, tiles, cost, and buffer footprint | Plan additional buffers/stages before allocation. Do not select illegal maps |
-| KTDFLow→DFIR | Reserved units/registers and concrete maps | Lower to existing operations, eliminating EA abstractions. Fail if EA-specific information remains; no Dataflow extension |
+|Stage|Information retained and responsibility|Finalization / verification point|
+|---|---|---|
+|OpSpec|Logical dtype and device format, EA, geometry, validity, fixed memory/core boundaries, cast rounding|Pass on upstream decisions without losing information. Separate the schema for mixed-format casts from ordinary arithmetic|
+|KTIR|Numeric tensors with encoding, consumer requirements, explicit cast/rearrange|Select candidates across operations. Verify loads, broadcasts, reductions, shape transformations, and region arguments|
+|Early KTDF|Verified tensor-to-memref/FIFO bridge, resource candidates, transfer widths, temporary storage|Expose numerical cast resources and widths by pre_scheduling and reflect them in MaterializeRegisters/path expansion|
+|Late KTDF|Tiles/owners, concrete transfer order, FIFO capacity, concrete implementation plans for rearrange|Finalize in post_scheduling after TileSizeSelection, before CustomLinalgBufferization/OrderFifoSlotsByUse/AddressAssignment|
+|KTDFLow → DFIR|Expand already-planned local shuffle and similar obligations into existing operations|Consume all EA-v1 types, attributes, and operations. Do not discover additional required buffers after allocation|
 
-Current KTDF `splat` leaves an obligation on a FIFO read, then lowers it to an existing `vectorchain.shuffle` immediately after `dataflow.receive`. This precedent supports late materialization, but does not prove the implementation of arbitrary EA transformations.[S5][S6]
+As with the existing `read_from_fifo.splat`, attributes describing already-planned local conversions may be retained into KTDFLow. This differs from performing allocation while arrangement candidates remain unresolved. H10 includes this bridge and the phase contracts; it is not merely a change to encoding.[D2][D3][D4]
 
-| Abstract processing | Existing final representation | Remaining checks |
-| --- | --- | --- |
-| Correspondence in memory | Existing layout_map of `dataflow.get_logical_memory_view`, agen load/store order/set | Byte/element units, alignment, masks, and maps capable of expressing the target EA |
-| Lane reordering/duplication | `vectorchain.shuffle`, existing registers and send/receive | Same element type, indices/widths, and shuffles supported by the hardware |
-| Numerical cast | `vectorchain.cast` syntax exists | Implementation of bf16/DL16 semantics, rounding, and dtype pairs. Syntax alone does not establish legality |
-| Large restickify | Existing view/agen/transfer and the #229 premise | Connection for the target EA pair/shape, capacity, and cost |
+Begin optimization with identity elimination for identical mappings, composition of consecutive rearranges, and sharing conversions with the same source and target. Moving a conversion across a pointwise operation requires aligned index mappings for all operands; reductions must preserve masks, initializers, and trees. FIFO reads/writes have effects, so preserve consumption counts and token ordering, and do not globally retag a producer at fan-out. Preserve per-element rounding even when fusing a numerical cast and EA conversion into one instruction.
 
-The following operation sequence was confirmed in generated addition DFIR (surrounding definitions omitted). It is not an example of completed Dataflow generation for any of the four programs.
+Implementation order: P001 contracts + P005 numerical/operation foundations → P002 bounded boundary legalization → P003 information retention with optimization disabled → EA-P004 arrangement selection and conversion optimization. If type support requires overly broad changes, use the P006 attribute approach as an intermediate step. Completion requires validating all four examples with aligned repository pins; a CLOSED issue or success on the separate SDSC route is not a substitute.
 
-```mlir
-%9 = dataflow.receive %8 : vector<64xf16>
-%12 = dataflow.receive %11 : vector<64xf16>
-%13 = vectorchain.binary %9, %12
-  {binary_op = #vectorchain<binary_operator add>,
-   op_specific_map = affine_map<(d0) -> (d0)>}
-  : vector<64xf16>, vector<64xf16>, vector<64xf16>
-dataflow.send %15, %13 : vector<64xf16>
-```
+## 3. Candidate Comparison and Adoption Decisions
 
-### 2.2 Legality Conditions for Transformation Optimization
+|Candidate|Advantages|Disadvantages and mandatory conditions|Decision|
+|---|---|---|---|
+|H1: New KTIR operations|Visible conversions; retain existing tensor types|Value EA depends on analysis; concretization is required at the KTIR exit|Short-term component|
+|H2: Attributes on existing KTIR operations|Limited type changes; express use requirements|Requires attribute preservation and dedicated checks for identity folding and block arguments|Useful for bridges|
+|H3: New KTIR type|Enforce EA through types|Standard linalg/KTDP depend on RankedTensorType. Adding a type alone does not establish the connection|Reject as a standalone design|
+|H4: Extend existing KTIR types|Strengthen access boundaries|AccessTile is a coordinate type and does not cover numeric SSA values|Reject as a standalone design|
+|H5: KTIR encoding|Gain type safety while retaining builtin tensors|Requires bufferization support and early finalization. Tensor extf cannot directly change encoding; scalar casts inside generic, or equivalent handling, are needed|Strong simplified alternative|
+|H6: New KTIR + KTDF operations|Retain explicit conversions until resource selection|Requires additional propagation interfaces, costing, and lowering|Recommended operation representation|
+|H7: KTIR + KTDF attributes|Cover memrefs/FIFOs; facilitate incremental adoption|Supplement type safety with dedicated verifiers; audit cloning, fusion, and read consumption|P006 principal alternative / P003 bridge|
+|H8: New KTIR + KTDF types|Potentially strong type contracts|Requires extensive support in standard operations and KTDF reads/writes|Reject unless a broader IR overhaul is justified|
+|H9: Extend existing KTIR + KTDF types|Useful for strengthening FIFO boundaries|AccessTile/FifoSlot alone do not cover compute tensors. No general VariableType exists|Reject as a standalone design|
+|H10: KTIR + KTDF encoding|Clear responsibilities for value EA, edge conversions, and selection across stages|Requires H6 and a buffer/FIFO bridge. Encoding itself does not change data|P003 preferred medium- to long-term design|
+|H11: Early expansion into views/indices|Facilitates bounded adoption using existing representations|The complete U → S connection is unverified. Expansion loses conversion intent and complicates SSA/fan-out optimization|Bounded lowering / alternative|
 
-A pure EA transformation preserves logical dtype, shape, and the bits of valid elements. Identity/inverse-transformation elimination and CSE are allowed only when maps, validity, replication semantics, ownership, timing, and aliases match. Moving a transformation across a pointwise operation applies the same logical correspondence to all non-broadcast inputs and updates broadcast axes. Moving it across a reduction must preserve not only the element set but also the contracts for masks, identity elements, accumulation dtype, and operation order.
+Rejection of H3/H4/H8/H9 applies to standalone designs that retain the current standard infrastructure. Supplementing them with new compute operations or H7/H10 produces a different composite design. Do not score runtime based solely on the merits of a type representation. All candidates are subject to the same numerical cast requirements, operation support for the four examples, and DFIR constraint.
 
-Fusion with a cast is allowed only when it preserves the original numerical conversion and the number and positions of rounding steps. Distinguish this from moving a cast before or after arithmetic. Preserve an EA whose map is unknown as an opaque state, and block rewrites requiring that map. EXX2 includes semantic pairs, so not every EA can be treated as a permutation.
+|Conditional static comparison|When retaining U is legal|When a separate copy restores S after each cast|
+|---|---:|---:|
+|A (524,288 elements)|0 additional EA-only payload|6 MiB|
+|B (same activation + 4,096 weights)|0|6 MiB + 32 KiB|
+|C (16,384 elements × 2 outputs)|128 KiB|128 KiB|
+|D (16,384 elements)|128 KiB (output restoration)|128 KiB (restoration after input conversion)|
 
-### 2.3 Rollout Order and Acceptance
+These are payload totals for one read + one write, excluding padding, core replication, transaction widths, register/LX/HBM placement, and runtime. Numerical casts are a separate common cost. Direct S → S casts would reduce extra copies; expensive U operations could make retention less favorable. The minimum additional validation covers arrangement mappings, BF16 numerical boundaries, actual generated instructions under aligned pins, and the four examples. Use those results to confirm or revise the recommendation.
 
-Use P001 to fix numerical/EA contracts and versions, then P002 to implement casts, B's grid, A/B's mean, C's geometry/primitives, and C/D outputs end to end. Prototype P003/P004 on the same graph cuts and compare information preservation to select the carrier. Then use P005 to evaluate transformation counts, bytes, temporary storage, compilation time, and measured latency separately. Sub-issue and PR proposals for each boundary are collected in §7 of the full report.
+Report preparation is complete, but device agreement for the four examples, implementation of the proposals, and performance evaluation remain outstanding. See the [full report](element-arrangement-ktir-dfsc-full-15.en.md) for evidence, unverified items, proposed sub-issues and PRs for EA-P001–P006, and validation commands.
 
-Acceptance compares each of the four examples against its own CPU result. A/B use atol=rtol=0.1; C's cos and sin each use 0.02/0.02; D uses 0.001/0.01. Preserve the specified seeds, shapes, dtypes, and `dynamic=False`, and inspect IR for A's cast-before-weight, B's cast-after-weight, C's i64 positions/f32 inv_freq, and D's f32 output. Record row sums and argmax as D's diagnostics without introducing thresholds absent from the original.
-
-## 3. Benefits, Drawbacks, and Selection of Design Candidates
-
-### 3.1 Comparing the 11 Candidates Under the Same Conditions
-
-State carriers and transformation carriers are not mutually exclusive. The common evaluation uses `cast→square→fanout(reduce,STANDARD consumer)` and A–D in §1.2, with identical numerical cast positions and backend capabilities for all candidates.
-
-| Hypothesis | Benefits | Drawbacks / conditions | Decision |
-| --- | --- | --- | --- |
-| H1 New KTIR ops only | bind/convert make operations explicit; local optimization is possible | Verify EA for all values through analysis; materialization required before KTDF | Limited alternative when changing KTDF is difficult |
-| H2 Attributes on existing KTIR ops | Preserve types; small initial change | Missing attributes, block arguments, identity-copy elimination, and early commitment | Not the primary standalone candidate |
-| H3 New KTIR types | Type all SSA values | Breaks the RankedTensor assumptions of KTDP/Linalg; extensive adapters | Reject |
-| H4 Extend existing KTIR types | Partial uses such as access contracts | AccessTile represents only addresses; extending DF16 does not cover f32. Builtin schemas cannot be changed locally | Fails mandatory conditions as a standalone design |
-| H5 KTIR encoding | Type actual EA while retaining tensor infrastructure | Materialization before KTDF and updated shape inference required | Combine with H1; strong option if KTDF cannot be changed |
-| H6 New ops in both stages | Preserve transformation obligations until resources are fixed; facilitates CSE/fusion | Also needs a carrier for state contracts | Adopt in combination with H10 or H7 |
-| H7 Attributes on existing ops in both stages | Natural attachment to uses/FIFOs; splat precedent | Verification obligations for every clone, bufferization, and shape change | **Strong alternative EA-P004 with H6** |
-| H8 New types in both stages | Consistent typing from tensors through slots | Largest IR/API migration. No performance advantage from the carrier alone | Reconsider if a comprehensive redesign is independently needed |
-| H9 Extend existing types in both stages | KTDF FIFO parameters can be extended | H4's gaps remain on the KTIR side | Insufficient alone. The FIFO portion is an implementation mechanism for H10 |
-| H10 Encoding in both stages | Place actual EA in types and retain choices through KTDF | FIFO/memref do not use tensor encoding, so adapters are mandatory | **Conditional recommendation EA-P003 with H6** |
-| H11 Analysis tables / use contracts, etc. | Suited to candidate sets, cost, and fanout analysis | A table alone loses semantics across serialization or separate processes | Adopt as a supplement, not the sole semantic carrier |
-
-The mandatory conditions are numerical semantics, verification of required EA and transformations, connection to the target path, no Dataflow extensions, and explicit additional backend assumptions. H4/H9 alone cannot represent the necessary data SSA values. Other candidates are also conditional because final lowering for the four examples is unimplemented; defining a representation alone does not complete acceptance.
-
-### 3.2 Runtime Cost and Evidence for Selection
-
-Attributes and encoding have the same runtime cost for the same concrete schedule. The following is a **static proxy**, counting an independent pure EA read+write as `2*N*bytes`, excluding padding, transfer granularity, per-core replication, and fusion. It is not converted into time or percentage speedups.
-
-| Example | Numerical casts preserved | Candidate EA transformations / logical traffic |
-| --- | --- | --- |
-| A | Two: x upcast and result narrow | Zero additional transformations if computation stays in U and the reverse cast returns to S |
-| B | A's two plus weight upcast | Zero additional transformations if both multiplication inputs use U. If repair is needed, compare 32KiB on W with 4MiB on the activation side, subject to ownership conditions |
-| C | Position cast plus cos/sin narrowing | Two D16→S16 transformations after narrowing: 128KiB; total output buffers: 64KiB. Input geometry transformation is separate |
-| D | One: x upcast | One U32→S32 transformation: 128KiB; additional buffer: 64KiB |
-
-The minimum validation that could change the selection is to run the same O/A/D cuts through canonicalize/CSE, map/tile, FIFO, memref, and DFIR with both H10 + H6 and H7 + H6. If encoding requires extensive changes to standard passes, introduce the attribute design first. Both must demonstrate preservation at every boundary and materialization into existing final DFIR.
-
-Complete EA maps, the bf16/DL16 numerical cast contract, correspondence between installed builds and baselines, and transformation costs remain unresolved. In the short term, establish concrete failures and capability boundaries; in the medium to long term, move those same contracts into more suitable carriers and optimizers. Completing the report, successfully executing the four examples, and finalizing the design decision are separate milestones.
-
-[D1]: https://github.com/torch-spyre/dataflow-scheduler-mlir-dialects/blob/5df926aa2472d169dfd11a8f3f658387dba361d2/include/dataflow-scheduler/Dialect/KTDF/KTDFTypes.td#L75-L122
-[KF1]: https://github.com/torch-spyre/ktir-mlir-frontend/blob/1f96e5790a99b7aaf9a445b039044467c66e4e0a/include/ktir/Dialect/KTDP/KTDPDialect.td#L16-L43
-[KF4]: https://github.com/torch-spyre/ktir-mlir-frontend/blob/1f96e5790a99b7aaf9a445b039044467c66e4e0a/lib/Dialect/KTDP/KTDPOps.cpp#L1104-L1137
-[KF6]: https://github.com/torch-spyre/ktir-mlir-frontend/blob/1f96e5790a99b7aaf9a445b039044467c66e4e0a/include/ktir/Dialect/SpyreOp/SpyreOpTypes.td#L39-L87
-[S1]: https://github.com/torch-spyre/dataflow-scheduler/blob/9ceb2a8279098034c0819cf712fce6146fee2dbd/lib/Pipeline.cpp#L40-L172
-[S2]: https://github.com/torch-spyre/dataflow-scheduler/blob/9ceb2a8279098034c0819cf712fce6146fee2dbd/lib/Conversion/frontend/KTIRToScheduleIR/KTIRLegalityCheck.cpp#L52-L81
-[S3]: https://github.com/torch-spyre/dataflow-scheduler/blob/9ceb2a8279098034c0819cf712fce6146fee2dbd/lib/Dialect/KTDF/Utils/Utils.cpp#L225-L249
-[S4]: https://github.com/torch-spyre/dataflow-scheduler/blob/9ceb2a8279098034c0819cf712fce6146fee2dbd/lib/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/Utils.cpp#L36-L43
-[S5]: https://github.com/torch-spyre/dataflow-scheduler/blob/9ceb2a8279098034c0819cf712fce6146fee2dbd/lib/Transforms/SplatLegalizationPass.cpp#L81-L133
-[S6]: https://github.com/torch-spyre/dataflow-scheduler/blob/9ceb2a8279098034c0819cf712fce6146fee2dbd/lib/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/OperationLowerings.cpp#L111-L175
-[TS1]: https://github.com/torch-spyre/torch-spyre/blob/f1e0145364392eab4d5bfe1975429726f30becea/torch_spyre/_inductor/config.py#L117-L127
-[TS11]: https://github.com/torch-spyre/torch-spyre/blob/f1e0145364392eab4d5bfe1975429726f30becea/torch_spyre/_inductor/codegen/ktir.py#L205-L258
-[TS15]: https://github.com/torch-spyre/torch-spyre/blob/f1e0145364392eab4d5bfe1975429726f30becea/torch_spyre/execution/async_compile.py#L616-L713
-[TS2]: https://github.com/torch-spyre/torch-spyre/blob/f1e0145364392eab4d5bfe1975429726f30becea/torch_spyre/_inductor/scheduler.py#L648-L670
-[TS3]: https://github.com/torch-spyre/torch-spyre/blob/f1e0145364392eab4d5bfe1975429726f30becea/torch_spyre/csrc/types_mapping.h#L57-L100
-[TS5]: https://github.com/torch-spyre/torch-spyre/blob/f1e0145364392eab4d5bfe1975429726f30becea/torch_spyre/_inductor/dtype_ops.py#L51-L154
-
-[D6]: https://github.com/torch-spyre/dataflow-scheduler-mlir-dialects/blob/5df926aa2472d169dfd11a8f3f658387dba361d2/lib/Dialect/KTDF/KTDFOps.cpp#L1073-L1081
+[S1]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/config.py#L117-L127
+[S1b]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/scheduler.py#L648-L667
+[S2]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/execution/async_compile.py#L615-L740
+[S3]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/csrc/spyre_tensor_impl.h#L36-L95
+[S3b]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/csrc/types_mapping.h#L57-L85
+[S4]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/op_spec.py#L234-L386
+[S5]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/dtype_ops.py#L51-L154
+[S5b]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/spyre_kernel.py#L381-L409
+[S5c]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/spyre_kernel.py#L809-L912
+[S6]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/propagate_layouts.py#L523-L704
+[S6b]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/propagate_layouts.py#L1540-L1714
+[S7]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/pass_utils.py#L205-L269
+[S8]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/pass_utils.py#L2544-L2560
+[S8b]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/optimize_restickify.py#L819-L853
+[S9]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/codegen/ktir.py#L203-L258
+[S9b]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/codegen/ktir.py#L502-L518
+[S9c]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/codegen/ktir.py#L701-L763
+[S9d]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/codegen/ktir.py#L1382-L1413
+[S9e]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/codegen/ktir.py#L1686-L1724
+[S9f]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/codegen/ktir.py#L3722-L3753
+[S9g]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/tests/inductor/test_ktir_validate.py#L2291-L2302
+[S10]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/tools/ktir-mlir-frontend.pin#L1-L13
+[S10b]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/pyproject.toml#L26-L51
+[S11]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/execution/async_compile.py#L403-L407
+[S12]: https://github.com/torch-spyre/torch-spyre/blob/64870622fc39cda7e344a271decb901e7088c6c6/torch_spyre/_inductor/customops.py#L1281-L1334
+[F1]: https://github.com/torch-spyre/ktir-mlir-frontend/blob/1f96e5790a99b7aaf9a445b039044467c66e4e0a/include/ktir/Dialect/KTDP/KTDPTypes.td#L38-L59
+[F2]: https://github.com/torch-spyre/ktir-mlir-frontend/blob/1f96e5790a99b7aaf9a445b039044467c66e4e0a/include/ktir/Dialect/KTDP/KTDP.td#L275-L345
+[F3]: https://github.com/torch-spyre/ktir-mlir-frontend/blob/1f96e5790a99b7aaf9a445b039044467c66e4e0a/include/ktir/Dialect/KTDP/KTDP.td#L413-L450
+[F4]: https://github.com/torch-spyre/ktir-mlir-frontend/blob/1f96e5790a99b7aaf9a445b039044467c66e4e0a/include/ktir/Dialect/KTDP/KTDP.td#L589-L668
+[F5]: https://github.com/torch-spyre/ktir-mlir-frontend/blob/1f96e5790a99b7aaf9a445b039044467c66e4e0a/lib/Dialect/KTDP/KTDPOps.cpp#L1062-L1137
+[F6]: https://github.com/torch-spyre/ktir-mlir-frontend/blob/1f96e5790a99b7aaf9a445b039044467c66e4e0a/include/ktir/Dialect/SpyreOp/SpyreOpTypes.td#L39-L87
+[F7]: https://github.com/torch-spyre/ktir-mlir-frontend/blob/1f96e5790a99b7aaf9a445b039044467c66e4e0a/include/ktir/Dialect/SpyreOp/SpyreOp.td#L112-L123
+[F8]: https://github.com/torch-spyre/ktir-mlir-frontend/blob/1f96e5790a99b7aaf9a445b039044467c66e4e0a/lib/Conversion/ConvertToKTIR/KTIRCheckLegality.cpp#L41-L74
+[F9]: https://github.com/torch-spyre/ktir-mlir-frontend/blob/1f96e5790a99b7aaf9a445b039044467c66e4e0a/test/Dialect/KTDP/add.mlir#L33-L94
+[F10]: https://github.com/torch-spyre/ktir-mlir-frontend/blob/1f96e5790a99b7aaf9a445b039044467c66e4e0a/CMakeLists.txt#L16-L59
+[D1]: https://github.com/torch-spyre/dataflow-scheduler/blob/8893e6c62a8e3cbe159f4e8b446c1ca9b42db2da/lib/Pipeline.cpp#L40-L176
+[D2]: https://github.com/torch-spyre/dataflow-scheduler-mlir-dialects/blob/c3066e3f8d24168765fe25d541136979b6dd1d8b/include/dataflow-scheduler/Dialect/KTDF/KTDFTypes.td#L75-L135
+[D2b]: https://github.com/torch-spyre/dataflow-scheduler/blob/8893e6c62a8e3cbe159f4e8b446c1ca9b42db2da/lib/Conversion/frontend/KTIRToScheduleIR/KTIRBufferize.cpp#L118-L185
+[D2c]: https://github.com/torch-spyre/dataflow-scheduler/blob/8893e6c62a8e3cbe159f4e8b446c1ca9b42db2da/lib/Conversion/frontend/KTIRToScheduleIR/KTIRMapAndTile.cpp#L87-L150
+[D3]: https://github.com/torch-spyre/dataflow-scheduler-mlir-dialects/blob/c3066e3f8d24168765fe25d541136979b6dd1d8b/include/dataflow-scheduler/Dialect/KTDF/KTDF.td#L139-L239
+[D3b]: https://github.com/torch-spyre/dataflow-scheduler/blob/8893e6c62a8e3cbe159f4e8b446c1ca9b42db2da/lib/Transforms/SplatLegalizationPass.cpp#L81-L132
+[D3c]: https://github.com/torch-spyre/dataflow-scheduler-mlir-dialects/blob/c3066e3f8d24168765fe25d541136979b6dd1d8b/lib/Dialect/KTDF/KTDFOps.cpp#L1042-L1081
+[D4]: https://github.com/torch-spyre/dataflow-scheduler/blob/8893e6c62a8e3cbe159f4e8b446c1ca9b42db2da/lib/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/OperationLowerings.cpp#L68-L175
+[D5]: https://github.com/torch-spyre/dataflow-scheduler-mlir-dialects/blob/c3066e3f8d24168765fe25d541136979b6dd1d8b/include/dataflow-scheduler/Dialect/VectorChain/VectorChain.td#L226-L260
+[D5b]: https://github.com/torch-spyre/dataflow-scheduler-mlir-dialects/blob/c3066e3f8d24168765fe25d541136979b6dd1d8b/include/dataflow-scheduler/Dialect/VectorChain/VectorChain.td#L458-L538
+[D5c]: https://github.com/torch-spyre/dataflow-scheduler-mlir-dialects/blob/c3066e3f8d24168765fe25d541136979b6dd1d8b/lib/Dialect/VectorChain/VectorChain.cpp#L186-L250
+[D6]: https://github.com/torch-spyre/dataflow-scheduler-mlir-dialects/blob/c3066e3f8d24168765fe25d541136979b6dd1d8b/include/dataflow-scheduler/Dialect/Dataflow/Dataflow.td#L242-L339
+[D7]: https://github.com/torch-spyre/dataflow-scheduler/blob/8893e6c62a8e3cbe159f4e8b446c1ca9b42db2da/lib/Conversion/frontend/KTIRToScheduleIR/KTIRLegalityCheck.cpp#L53-L81
+[D7b]: https://github.com/torch-spyre/dataflow-scheduler/blob/8893e6c62a8e3cbe159f4e8b446c1ca9b42db2da/lib/Conversion/backend/ScheduleIRToDFIR/KTDFLowToDFIR/LinalgLowering.cpp#L157-L242
+[D8]: https://github.com/torch-spyre/dataflow-scheduler/blob/8893e6c62a8e3cbe159f4e8b446c1ca9b42db2da/test/Conversion/frontend/KTIRToScheduleIR/ComputeGroupExtraction/basic.mlir#L163-L223
+[T1]: https://github.com/torch-spyre/triton/blob/77984beaaf253d6636da8f1a4f7acd0f32838e93/third_party/spyre/backend/compiler.py#L493-L724
+[T2]: https://github.com/torch-spyre/triton/blob/77984beaaf253d6636da8f1a4f7acd0f32838e93/third_party/spyre/include/Dialect/TTS/IR/TTSOps.td#L14-L52
+[R1]: https://github.com/torch-spyre/RFCs/blob/f4f8efd13578b4fe9de70f3f946f751fc32e4b3b/0682-KtirSpec/0682-KtirSpecRFC.md#L18-L45
+[R2]: https://github.com/torch-spyre/RFCs/blob/f4f8efd13578b4fe9de70f3f946f751fc32e4b3b/0682-KtirSpec/0682-KtirSpecRFC.md#L75-L103
+[R3]: https://github.com/torch-spyre/RFCs/blob/f4f8efd13578b4fe9de70f3f946f751fc32e4b3b/0047-TiledTensors/0047-TiledTensorsRFC.md#L54-L142
+[R4]: https://github.com/torch-spyre/RFCs/blob/f4f8efd13578b4fe9de70f3f946f751fc32e4b3b/0047-TiledTensors/0047-TiledTensorsRFC.md#L183-L205
+[R5]: https://github.com/torch-spyre/RFCs/blob/c2ce6ac7d0a28e31f741bfbcf61daf73a72444d8/2971-FP32ElementArrangement/2971-FP32ElementArrangementRFC.md#L10-L94
+[R6]: https://github.com/torch-spyre/RFCs/blob/c2ce6ac7d0a28e31f741bfbcf61daf73a72444d8/2971-FP32ElementArrangement/2971-FP32ElementArrangementRFC.md#L96-L176
+[R7]: https://github.com/torch-spyre/RFCs/blob/94a2131e5919d8adb3b02e34c7547eb01da8fdb5/2971-FP32ElementArrangement/2971-FP32ElementArrangementRFC.md#L36-L80
+[R8]: https://github.com/torch-spyre/RFCs/blob/94a2131e5919d8adb3b02e34c7547eb01da8fdb5/2971-FP32ElementArrangement/2971-FP32ElementArrangementRFC.md#L109-L132
+[I-D65]: https://github.com/torch-spyre/dataflow-scheduler/issues/65
+[I-D82]: https://github.com/torch-spyre/dataflow-scheduler/issues/82
+[I-R39]: https://github.com/torch-spyre/RFCs/pull/39
+[I-F17]: https://github.com/torch-spyre/ktir-mlir-frontend/issues/17
+[I-S3423]: https://github.com/torch-spyre/torch-spyre/issues/3423
